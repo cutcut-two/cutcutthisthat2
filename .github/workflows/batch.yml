@@ -1,0 +1,81 @@
+name: batch
+# Generic sharded batch job. Repo is PUBLIC: steps print counts only, results go to a private release, never artifacts.
+on:
+  workflow_dispatch:
+    inputs:
+      kinds: { description: 'job kinds (space separated)', required: true }
+      shards: { description: 'parallel shards', default: '12' }
+      tag: { description: 'output release tag', required: true }
+      only: { description: 'trial: comma list (forces)', default: '' }
+      hours: { description: 'stop starting work after N hours', default: '4.8' }
+      mode: { description: 'bake | tpl', default: 'bake' }
+      seed: { description: 'earlier output tags to unpack first (space separated)', default: '' }
+      par: { description: 'max parallel jobs', default: '12' }
+      args: { description: 'extra tool flags', default: '' }
+      list: { description: 'explicit shard specs i/N (space separated), overrides shards', default: '' }
+
+env:
+  GH_TOKEN: ${{ secrets.BATCH_TOKEN || secrets.VIBECUT_PAT }}
+  CODE: ${{ vars.BATCH_CODE_REPO }}
+  REF: ${{ vars.BATCH_CODE_REF }}
+  DATA: ${{ vars.BATCH_DATA_REPO }}
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    outputs: { m: '${{ steps.m.outputs.m }}' }
+    steps:
+      - id: m
+        run: |
+          L="${{ inputs.list }}"; [ -n "$L" ] || L=$(seq -s ' ' -f "%g/${{ inputs.shards }}" 0 $(( ${{ inputs.shards }} - 1 )))
+          echo "m=$(jq -cn --arg l "$L" '$l|split(" ")|map(select(length>0))')" >> "$GITHUB_OUTPUT"
+          gh release view "${{ inputs.tag }}" -R "$DATA" >/dev/null 2>&1 || gh release create "${{ inputs.tag }}" -R "$DATA" --notes "" >/dev/null
+
+  run:
+    needs: prep
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(inputs.par) }} # <= 12: 8 slots stay free for the other bots (20 total)
+      matrix: { shard: '${{ fromJSON(needs.prep.outputs.m) }}' }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CODE }}
+          ref: ${{ env.REF }}
+          token: ${{ env.GH_TOKEN }}
+          path: w/code
+          sparse-checkout: |
+            scripts/kho
+            scripts/parity
+            shared/kho
+            shared/contract
+      - uses: actions/checkout@v4
+        with: { repository: '${{ env.DATA }}', token: '${{ env.GH_TOKEN }}', path: w/vibeart-src }
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 }
+      - name: deps
+        run: |
+          sudo sysctl -qw kernel.apparmor_restrict_unprivileged_userns=0
+          sudo apt-get -qq update >/dev/null && sudo apt-get -qq install -y ffmpeg webp fonts-noto-color-emoji python3-numpy python3-pil >/dev/null
+      - name: input
+        run: |
+          mkdir -p o && gh release download input -R "$DATA" -D o
+          rm -rf w/vibeart-src/kho/media && tar xzf o/media.tgz -C w/vibeart-src/kho && rm o/media.tgz
+          mkdir -p o/tpl o/seed
+          for t in ${{ inputs.seed }}; do gh release download "$t" -R "$DATA" -p 's*.tgz' -D o/seed --clobber; for f in o/seed/*.tgz; do tar xzf "$f" -C o/tpl; done; rm -f o/seed/*; done
+          [ -z "${{ inputs.only }}" ] || : > o/ledger.jsonl
+      - name: work
+        env: { CHROME: /usr/bin/google-chrome, ONLY: '${{ inputs.only }}', TPL_ARGS: '${{ inputs.args }}' }
+        run: |
+          until=$(( $(date +%s) + $(python3 -c "print(int(${{ inputs.hours }}*3600))") ))
+          bash w/code/scripts/kho/runner_${{ inputs.mode }}.sh "${{ matrix.shard }}" "$PWD/o" "$until" ${{ inputs.kinds }}
+      - name: upload
+        if: always()
+        run: |
+          [ -f o/result.tgz ] || exit 0
+          N="s$(echo "${{ matrix.shard }}" | tr / _)-${{ github.run_id }}-${{ github.run_attempt }}.tgz"
+          cp o/result.tgz "$N"
+          gh release upload "${{ inputs.tag }}" -R "$DATA" --clobber "$N" >/dev/null
+          echo "uploaded $(du -h o/result.tgz | cut -f1)"
